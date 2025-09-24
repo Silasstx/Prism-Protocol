@@ -1,6 +1,6 @@
 ;; Prism Protocol - Automated Yield Aggregation Contract
 ;; A decentralized protocol for automated yield compounding across multiple DeFi protocols
-;; Now supporting multi-token deposits with SIP-10 compatibility
+;; Now supporting multi-token deposits with SIP-10 compatibility and DAO governance
 ;; FIXED VERSION - All potentially unchecked data operations secured
 
 ;; Constants
@@ -19,6 +19,19 @@
 (define-constant err-transfer-failed (err u111))
 (define-constant err-arithmetic-overflow (err u112))
 (define-constant err-division-by-zero (err u113))
+(define-constant err-proposal-not-found (err u114))
+(define-constant err-already-voted (err u115))
+(define-constant err-voting-ended (err u116))
+(define-constant err-voting-active (err u117))
+(define-constant err-insufficient-voting-power (err u118))
+(define-constant err-proposal-not-passed (err u119))
+
+;; Governance Constants
+(define-constant min-voting-period u1008) ;; ~1 week in blocks
+(define-constant max-voting-period u4032) ;; ~4 weeks in blocks
+(define-constant min-voting-power u100000000) ;; 1 STX minimum to create proposal
+(define-constant quorum-threshold u5000) ;; 50% quorum required
+(define-constant approval-threshold u5000) ;; 50% approval required
 
 ;; Data Variables
 (define-data-var total-value-locked uint u0)
@@ -26,6 +39,11 @@
 (define-data-var compound-threshold uint u1000000) ;; 1 STX minimum for compounding
 (define-data-var last-compound-block uint u0)
 (define-data-var supported-token-count uint u0)
+
+;; Governance Variables
+(define-data-var next-proposal-id uint u1)
+(define-data-var governance-token principal .governance-token)
+(define-data-var voting-delay uint u144) ;; ~1 day delay before voting starts
 
 ;; Data Maps
 (define-map user-deposits principal uint)
@@ -64,6 +82,28 @@
 })
 
 (define-map supported-tokens principal bool)
+
+;; Governance Maps
+(define-map proposals uint {
+    proposer: principal,
+    title: (string-ascii 100),
+    description: (string-ascii 500),
+    proposal-type: uint, ;; 1=fee-change, 2=add-strategy, 3=pause-strategy, 4=parameter-change
+    target-value: uint,
+    target-address: (optional principal),
+    start-block: uint,
+    end-block: uint,
+    for-votes: uint,
+    against-votes: uint,
+    executed: bool
+})
+
+(define-map proposal-votes {proposal-id: uint, voter: principal} {
+    voting-power: uint,
+    vote-for: bool
+})
+
+(define-map user-voting-power principal uint)
 
 ;; Private Functions
 (define-private (calculate-shares (amount uint) (total-supply uint) (total-assets uint))
@@ -142,6 +182,14 @@
     (and (> (len input) u0) (<= (len input) u50))
 )
 
+(define-private (validate-proposal-string (input (string-ascii 100)))
+    (and (> (len input) u0) (<= (len input) u100))
+)
+
+(define-private (validate-description (input (string-ascii 500)))
+    (and (> (len input) u0) (<= (len input) u500))
+)
+
 (define-private (validate-principal (addr principal))
     (not (is-eq addr tx-sender))
 )
@@ -152,6 +200,42 @@
 
 (define-private (validate-token-contract (token-contract principal))
     (not (is-eq token-contract (as-contract tx-sender)))
+)
+
+(define-private (calculate-voting-power (user principal))
+    (let ((user-share-amount (get-user-shares user))
+          (total-share-amount (var-get total-value-locked)))
+        (if (> total-share-amount u0)
+            (/ (* user-share-amount u10000) total-share-amount)
+            u0
+        )
+    )
+)
+
+(define-private (is-proposal-active (proposal-id uint))
+    (match (map-get? proposals proposal-id)
+        proposal-data
+        (let ((current-block stacks-block-height)
+              (start-block (get start-block proposal-data))
+              (end-block (get end-block proposal-data)))
+            (and (>= current-block start-block)
+                 (<= current-block end-block)
+                 (not (get executed proposal-data)))
+        )
+        false
+    )
+)
+
+(define-private (calculate-total-voting-power)
+    (var-get total-value-locked)
+)
+
+(define-private (validate-proposal-type (proposal-type uint))
+    (and (> proposal-type u0) (<= proposal-type u4))
+)
+
+(define-private (validate-voting-period (period uint))
+    (and (>= period min-voting-period) (<= period max-voting-period))
 )
 
 ;; Read-Only Functions
@@ -267,6 +351,45 @@
 (define-read-only (is-token-pool-active (token-contract principal))
     (match (get-token-pool-info token-contract)
         pool-info (get active pool-info)
+        false
+    )
+)
+
+;; Governance Read-Only Functions
+(define-read-only (get-proposal (proposal-id uint))
+    (map-get? proposals proposal-id)
+)
+
+(define-read-only (get-next-proposal-id)
+    (var-get next-proposal-id)
+)
+
+(define-read-only (get-user-voting-power (user principal))
+    (calculate-voting-power user)
+)
+
+(define-read-only (get-proposal-vote (proposal-id uint) (voter principal))
+    (map-get? proposal-votes {proposal-id: proposal-id, voter: voter})
+)
+
+(define-read-only (has-voted (proposal-id uint) (voter principal))
+    (is-some (get-proposal-vote proposal-id voter))
+)
+
+(define-read-only (get-voting-delay)
+    (var-get voting-delay)
+)
+
+(define-read-only (is-proposal-passed (proposal-id uint))
+    (match (get-proposal proposal-id)
+        proposal-data
+        (let ((total-votes (+ (get for-votes proposal-data) (get against-votes proposal-data)))
+              (total-voting-power (calculate-total-voting-power))
+              (quorum-met (>= (* total-votes u10000) (* total-voting-power quorum-threshold)))
+              (approval-met (>= (* (get for-votes proposal-data) u10000) 
+                               (* total-votes approval-threshold))))
+            (and quorum-met approval-met (>= stacks-block-height (get end-block proposal-data)))
+        )
         false
     )
 )
@@ -582,6 +705,175 @@
     )
 )
 
+;; Governance Functions
+(define-public (create-proposal 
+    (title (string-ascii 100))
+    (description (string-ascii 500))
+    (proposal-type uint)
+    (target-value uint)
+    (target-address (optional principal))
+    (voting-period uint)
+)
+    (let (
+        (current-proposal-id (var-get next-proposal-id))
+        (proposer-voting-power (calculate-voting-power tx-sender))
+        (start-block (+ stacks-block-height (var-get voting-delay)))
+        (end-block (+ start-block voting-period))
+        (validated-target-value (if (and (> target-value u0) (<= target-value u1000000000000)) target-value u0))
+        (validated-target-address (if (is-some target-address) target-address none))
+    )
+        (asserts! (validate-proposal-string title) err-invalid-amount)
+        (asserts! (validate-description description) err-invalid-amount)
+        (asserts! (validate-proposal-type proposal-type) err-invalid-strategy)
+        (asserts! (validate-voting-period voting-period) err-invalid-amount)
+        (asserts! (>= proposer-voting-power min-voting-power) err-insufficient-voting-power)
+        (asserts! (<= validated-target-value u1000000000000) err-arithmetic-overflow)
+        (asserts! (< current-proposal-id u1000000) err-arithmetic-overflow)
+        
+        (map-set proposals current-proposal-id {
+            proposer: tx-sender,
+            title: title,
+            description: description,
+            proposal-type: proposal-type,
+            target-value: validated-target-value,
+            target-address: validated-target-address,
+            start-block: start-block,
+            end-block: end-block,
+            for-votes: u0,
+            against-votes: u0,
+            executed: false
+        })
+        
+        (var-set next-proposal-id (+ current-proposal-id u1))
+        (ok current-proposal-id)
+    )
+)
+
+(define-public (vote (proposal-id uint) (vote-for bool))
+    (match (get-proposal proposal-id)
+        proposal-data
+        (let (
+            (voter-power (calculate-voting-power tx-sender))
+            (current-for-votes (get for-votes proposal-data))
+            (current-against-votes (get against-votes proposal-data))
+            (new-for-votes (if vote-for 
+                              (unwrap! (safe-add current-for-votes voter-power) err-arithmetic-overflow)
+                              current-for-votes))
+            (new-against-votes (if vote-for 
+                                  current-against-votes
+                                  (unwrap! (safe-add current-against-votes voter-power) err-arithmetic-overflow)))
+            (proposer (get proposer proposal-data))
+            (title (get title proposal-data))
+            (description (get description proposal-data))
+            (proposal-type (get proposal-type proposal-data))
+            (target-value (get target-value proposal-data))
+            (target-address (get target-address proposal-data))
+            (start-block (get start-block proposal-data))
+            (end-block (get end-block proposal-data))
+            (executed (get executed proposal-data))
+        )
+            (asserts! (> proposal-id u0) err-proposal-not-found)
+            (asserts! (< proposal-id (var-get next-proposal-id)) err-proposal-not-found)
+            (asserts! (is-proposal-active proposal-id) err-voting-ended)
+            (asserts! (not (has-voted proposal-id tx-sender)) err-already-voted)
+            (asserts! (> voter-power u0) err-insufficient-voting-power)
+            (asserts! (<= new-for-votes u1000000000000) err-arithmetic-overflow)
+            (asserts! (<= new-against-votes u1000000000000) err-arithmetic-overflow)
+            (asserts! (validate-proposal-string title) err-invalid-amount)
+            (asserts! (validate-description description) err-invalid-amount)
+            (asserts! (validate-proposal-type proposal-type) err-invalid-strategy)
+            (asserts! (<= target-value u1000000000000) err-arithmetic-overflow)
+            (asserts! (<= start-block end-block) err-invalid-amount)
+            
+            (map-set proposal-votes {proposal-id: proposal-id, voter: tx-sender} {
+                voting-power: voter-power,
+                vote-for: vote-for
+            })
+            
+            (map-set proposals proposal-id {
+                proposer: proposer,
+                title: title,
+                description: description,
+                proposal-type: proposal-type,
+                target-value: target-value,
+                target-address: target-address,
+                start-block: start-block,
+                end-block: end-block,
+                for-votes: new-for-votes,
+                against-votes: new-against-votes,
+                executed: executed
+            })
+            
+            (ok true)
+        )
+        err-proposal-not-found
+    )
+)
+
+(define-public (execute-proposal (proposal-id uint))
+    (match (get-proposal proposal-id)
+        proposal-data
+        (let (
+            (proposal-type (get proposal-type proposal-data))
+            (target-value (get target-value proposal-data))
+            (target-address (get target-address proposal-data))
+            (executed (get executed proposal-data))
+            (proposer (get proposer proposal-data))
+            (title (get title proposal-data))
+            (description (get description proposal-data))
+            (start-block (get start-block proposal-data))
+            (end-block (get end-block proposal-data))
+            (for-votes (get for-votes proposal-data))
+            (against-votes (get against-votes proposal-data))
+        )
+            (asserts! (> proposal-id u0) err-proposal-not-found)
+            (asserts! (< proposal-id (var-get next-proposal-id)) err-proposal-not-found)
+            (asserts! (not executed) err-already-exists)
+            (asserts! (is-proposal-passed proposal-id) err-proposal-not-passed)
+            (asserts! (validate-proposal-string title) err-invalid-amount)
+            (asserts! (validate-description description) err-invalid-amount)
+            (asserts! (validate-proposal-type proposal-type) err-invalid-strategy)
+            (asserts! (<= target-value u1000000000000) err-arithmetic-overflow)
+            (asserts! (<= for-votes u1000000000000) err-arithmetic-overflow)
+            (asserts! (<= against-votes u1000000000000) err-arithmetic-overflow)
+            (asserts! (<= start-block end-block) err-invalid-amount)
+            
+            ;; Execute based on proposal type
+            (if (is-eq proposal-type u1) ;; fee-change
+                (begin
+                    (asserts! (<= target-value u1000) err-invalid-amount) ;; Max 10%
+                    (var-set protocol-fee-rate target-value)
+                )
+                (if (is-eq proposal-type u4) ;; parameter-change
+                    (begin
+                        (asserts! (validate-amount target-value) err-invalid-amount)
+                        (var-set compound-threshold target-value)
+                    )
+                    true ;; Other proposal types handled separately
+                )
+            )
+            
+            ;; Mark proposal as executed
+            (map-set proposals proposal-id {
+                proposer: proposer,
+                title: title,
+                description: description,
+                proposal-type: proposal-type,
+                target-value: target-value,
+                target-address: target-address,
+                start-block: start-block,
+                end-block: end-block,
+                for-votes: for-votes,
+                against-votes: against-votes,
+                executed: true
+            })
+            
+            (ok true)
+        )
+        err-proposal-not-found
+    )
+)
+
 ;; Admin Functions
 (define-public (update-protocol-fee (new-fee uint))
     (begin
@@ -642,6 +934,16 @@
             (ok true)
         )
         err-token-not-supported
+    )
+)
+
+(define-public (update-voting-delay (new-delay uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (<= new-delay u1008) err-invalid-amount) ;; Max 1 week
+        
+        (var-set voting-delay new-delay)
+        (ok true)
     )
 )
 
